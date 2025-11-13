@@ -1,3 +1,5 @@
+# File: ~/ai-sim-lab/src/ai_sim_lab/core/agent.py
+
 from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
@@ -9,7 +11,7 @@ from .tooling import ToolRegistry
 
 class Agent:
     """
-    An Agent with optional Tools and its own systemrole.
+    A single LLM-based agent with an optional tool registry and a system prompt.
     """
 
     def __init__(
@@ -30,43 +32,64 @@ class Agent:
         sandbox: SandboxState,
     ) -> List[Dict[str, Any]]:
         """
-        Runs a Full term with:
-        - Assistent-Anwser
-        - Tool-Calls -> Run Tools -> Tool-Messages
-        - another Assistant-Call, until no more Tools are required
-        conversation: Messeage without Systemprompt.
-        gives back: conversation (ohne Systemprompt).
+        Run a full tool-aware turn:
+
+        - Call the model.
+        - If the model requests tool calls, execute them against the sandbox.
+        - Feed the tool results back to the model.
+        - Repeat until the model no longer requests tools.
+
+        `conversation` does NOT include the system prompt.
+        Returns the updated conversation (still without the system prompt).
         """
-        messages = [{"role": "system", "content": self.system_prompt}] + conversation
+        # Internal messages list including the system prompt for the API.
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt}
+        ] + conversation
 
         while True:
             tools_schema = self.tools.get_schemas() if self.tools else None
             message = self.llm.chat(messages, tools=tools_schema)
 
+            content = message.content or ""
+
+            # Build the assistant message to append back into the history.
             assistant_msg: Dict[str, Any] = {
                 "role": "assistant",
                 "name": self.name,
-                "content": message.content,
+                "content": content,
             }
 
-            # Adding Tool-Calls to transcript for logging purposes
-            if getattr(message, "tool_calls", None):
+            tool_calls = getattr(message, "tool_calls", None)
+
+            # If the model requested tool calls, we must mirror them fully
+            # so the next API call can legally include tool messages.
+            if tool_calls:
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
                     }
-                    for tc in message.tool_calls
+                    for tc in tool_calls
                 ]
+                # Optional: log requested tool calls.
+                for tc in tool_calls:
+                    sandbox.log(
+                        f"[TOOL_CALL_REQUEST] {tc.function.name} args={tc.function.arguments}"
+                    )
+
             messages.append(assistant_msg)
 
-            # if no more tools -> finished
-            if not getattr(message, "tool_calls", None):
+            # If there are no tool calls: we are done with this turn.
+            if not tool_calls:
                 break
 
-            # run tool and give back as "toolmesseage"
-            for tc in message.tool_calls:
+            # Execute each requested tool and append tool messages.
+            for tc in tool_calls:
                 tool = self.tools.get(tc.function.name)  # type: ignore[arg-type]
                 args = json.loads(tc.function.arguments)
                 result = tool.run(args, sandbox)
@@ -79,5 +102,5 @@ class Agent:
                 }
                 messages.append(tool_msg)
 
-        # remove Systemprompt
+        # Strip the system message again before returning.
         return messages[1:]
